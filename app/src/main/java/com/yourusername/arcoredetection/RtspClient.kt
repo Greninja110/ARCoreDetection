@@ -1,272 +1,419 @@
-package com.yourusername.arcoredetection
+package com.yourusername.arcoredetection.network
 
-import android.content.Context
-import android.net.Uri
-import androidx.lifecycle.LiveData
-import androidx.lifecycle.MutableLiveData
-import com.google.android.exoplayer2.ExoPlayer
-import com.google.android.exoplayer2.MediaItem
-import com.google.android.exoplayer2.Player
-import com.google.android.exoplayer2.source.rtsp.RtspMediaSource
-import com.yourusername.arcoredetection.models.DetectedObject
-import com.yourusername.arcoredetection.models.DetectionResult
-import kotlinx.coroutines.*
-import retrofit2.Retrofit
-import retrofit2.converter.gson.GsonConverterFactory
-import retrofit2.http.GET
+import android.media.Image
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
+import com.pedro.rtsp.rtsp.Protocol
+import com.pedro.rtsp.rtsp.RtspClient
+import com.pedro.rtsp.utils.ConnectCheckerRtsp
+import com.yourusername.arcoredetection.ARRenderer.ArTrackingData
+import com.yourusername.arcoredetection.ARRenderer.TapEvent
+import com.google.gson.Gson
 import timber.log.Timber
+import java.io.BufferedOutputStream
 import java.io.IOException
+import java.io.OutputStream
+import java.net.Socket
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
- * Client to handle RTSP streaming and communication with the detection server
+ * Handles RTSP streaming to laptop server with additional data channel for AR info
  */
-class RtspClient(private val context: Context) {
+class RtspClient(
+    private val serverIp: String,
+    private val rtspPort: Int = 8554,
+    private val dataPort: Int = 8555,
+    private val streamPath: String = "live"
+) {
+    // RTSP client for video streaming
+    private val rtspClient = RtspClient(object : ConnectCheckerRtsp {
+        override fun onAuthErrorRtsp() {
+            Timber.e("RTSP authentication error")
+            onErrorCallback?.invoke("RTSP authentication error")
+        }
 
-    // Server configuration
-    private var serverUrl: String = "http://192.168.1.100:5000" // Default, should be configurable
-    private var rtspUrl: String = "rtsp://192.168.1.100:8554/live" // Default RTSP URL
+        override fun onAuthSuccessRtsp() {
+            Timber.d("RTSP authentication success")
+        }
 
-    // ExoPlayer for RTSP playback
-    private var exoPlayer: ExoPlayer? = null
+        override fun onConnectionFailedRtsp(reason: String) {
+            Timber.e("RTSP connection failed: $reason")
+            isConnected = false
+            onErrorCallback?.invoke("RTSP connection failed: $reason")
+        }
+
+        override fun onConnectionStartedRtsp(rtspUrl: String) {
+            Timber.d("RTSP connection started to $rtspUrl")
+        }
+
+        override fun onConnectionSuccessRtsp() {
+            Timber.d("RTSP connection success")
+            isConnected = true
+            onConnectedCallback?.invoke()
+        }
+
+        override fun onDisconnectRtsp() {
+            Timber.d("RTSP disconnected")
+            isConnected = false
+            onDisconnectedCallback?.invoke()
+        }
+
+        override fun onNewBitrateRtsp(bitrate: Long) {
+            Timber.d("RTSP new bitrate: $bitrate")
+        }
+    })
+
+    // Data channel for AR tracking information
+    private var dataSocket: Socket? = null
+    private var dataOutputStream: BufferedOutputStream? = null
 
     // Connection state
-    private val _isConnected = MutableLiveData<Boolean>(false)
-    val isConnected: LiveData<Boolean> = _isConnected
+    private var isConnected = false
+    private var isStreaming = AtomicBoolean(false)
 
-    // Streaming state
-    private val _isStreaming = MutableLiveData<Boolean>(false)
-    val isStreaming: LiveData<Boolean> = _isStreaming
+    // Callbacks
+    private var onConnectedCallback: (() -> Unit)? = null
+    private var onDisconnectedCallback: (() -> Unit)? = null
+    private var onErrorCallback: ((String) -> Unit)? = null
 
-    // Detection results
-    private val _detectionResults = MutableLiveData<DetectionResult>()
-    val detectionResults: LiveData<DetectionResult> = _detectionResults
+    // Video encoder
+    private var videoEncoder: MediaCodec? = null
+    private val videoBufferInfo = MediaCodec.BufferInfo()
 
-    // Stats
-    private val _fps = MutableLiveData<Float>(0f)
-    val fps: LiveData<Float> = _fps
-
-    // Error state
-    private val _error = MutableLiveData<String?>(null)
-    val error: LiveData<String?> = _error
-
-    // Background job for fetching detections
-    private var detectionJob: Job? = null
-    private val isPolling = AtomicBoolean(false)
-
-    // API service for communicating with the server
-    private lateinit var apiService: DetectionApiService
+    // Gson for JSON serialization
+    private val gson = Gson()
 
     /**
-     * Configure the client with server URLs
+     * Connect to the RTSP server
      */
-    fun configure(serverUrl: String, rtspUrl: String) {
-        this.serverUrl = serverUrl
-        this.rtspUrl = rtspUrl
+    suspend fun connect(
+        onConnected: () -> Unit,
+        onDisconnected: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        withContext(Dispatchers.IO) {
+            onConnectedCallback = onConnected
+            onDisconnectedCallback = onDisconnected
+            onErrorCallback = onError
 
-        // Create Retrofit instance with new server URL
-        val retrofit = Retrofit.Builder()
-            .baseUrl(serverUrl)
-            .addConverterFactory(GsonConverterFactory.create())
-            .build()
-
-        apiService = retrofit.create(DetectionApiService::class.java)
-
-        Timber.d("Configured with server: $serverUrl, RTSP: $rtspUrl")
-    }
-
-    /**
-     * Initialize and prepare the ExoPlayer for RTSP streaming
-     */
-    fun initializePlayer(onVideoSizeChanged: ((width: Int, height: Int) -> Unit)? = null): ExoPlayer {
-        Timber.d("Initializing ExoPlayer for RTSP")
-
-        // Release existing player if any
-        releasePlayer()
-
-        // Create a new ExoPlayer instance
-        exoPlayer = ExoPlayer.Builder(context).build().apply {
-            // Add a listener to handle player events
-            addListener(object : Player.Listener {
-                override fun onPlaybackStateChanged(state: Int) {
-                    when (state) {
-                        Player.STATE_READY -> {
-                            Timber.d("Player ready, starting playback")
-                            play()
-                            _isStreaming.postValue(true)
-                        }
-                        Player.STATE_ENDED -> {
-                            Timber.d("Playback ended")
-                            _isStreaming.postValue(false)
-                        }
-                        Player.STATE_BUFFERING -> {
-                            Timber.d("Buffering...")
-                        }
-                        Player.STATE_IDLE -> {
-                            Timber.d("Player idle")
-                            _isStreaming.postValue(false)
-                        }
-                    }
-                }
-
-                // Updated to use the newer VideoSize class
-                override fun onVideoSizeChanged(videoSize: com.google.android.exoplayer2.video.VideoSize) {
-                    Timber.d("Video size changed: ${videoSize.width} x ${videoSize.height}")
-                    onVideoSizeChanged?.invoke(videoSize.width, videoSize.height)
-                }
-
-                override fun onPlayerError(error: com.google.android.exoplayer2.PlaybackException) {
-                    Timber.e("Player error: ${error.message}")
-                    _error.postValue("Streaming error: ${error.message}")
-                    _isStreaming.postValue(false)
-                }
-            })
-
-            // Set repeat mode to continuously stream
-            repeatMode = Player.REPEAT_MODE_OFF
-
-            // Prepare the RTSP media source
             try {
-                val rtspUri = Uri.parse(rtspUrl)
-                val mediaItem = MediaItem.fromUri(rtspUri)
-                val rtspMediaSource = RtspMediaSource.Factory()
-                    .setForceUseRtpTcp(true) // Force TCP for more reliable streaming
-                    .createMediaSource(mediaItem)
+                // Configure RTSP client
+                rtspClient.setProtocol(Protocol.TCP)
 
-                setMediaSource(rtspMediaSource)
-                prepare()
+                // Connect data channel for AR tracking info
+                connectDataChannel()
 
-                _isConnected.postValue(true)
+                // Note: We don't actually connect the RTSP client here,
+                // that happens when we start streaming
 
-                Timber.d("Player prepared with RTSP source: $rtspUrl")
             } catch (e: Exception) {
-                Timber.e(e, "Failed to prepare RTSP source")
-                _error.postValue("Failed to prepare RTSP stream: ${e.message}")
-                _isConnected.postValue(false)
+                Timber.e(e, "Failed to connect to server")
+                onError("Failed to connect: ${e.message}")
             }
         }
-
-        return exoPlayer!!
     }
 
     /**
-     * Release the ExoPlayer resources
+     * Connect the data channel for AR tracking information
      */
-    fun releasePlayer() {
-        exoPlayer?.let {
-            Timber.d("Releasing player")
-            it.stop()
-            it.release()
-        }
-        exoPlayer = null
-        _isStreaming.postValue(false)
-    }
+    private fun connectDataChannel() {
+        try {
+            // Create socket and output stream
+            dataSocket = Socket(serverIp, dataPort)
+            dataOutputStream = BufferedOutputStream(dataSocket!!.getOutputStream())
 
-    /**
-     * Start streaming from the RTSP server
-     */
-    fun startStreaming() {
-        exoPlayer?.let {
-            Timber.d("Starting stream playback")
-            it.play()
-        } ?: run {
-            Timber.e("Cannot start streaming: Player not initialized")
-            _error.postValue("Player not initialized")
+            Timber.d("Data channel connected to $serverIp:$dataPort")
+
+        } catch (e: IOException) {
+            Timber.e(e, "Failed to connect data channel")
+            throw e
         }
     }
 
     /**
-     * Stop streaming from the RTSP server
+     * Initialize video encoder for RTSP streaming
      */
-    fun stopStreaming() {
-        exoPlayer?.let {
-            Timber.d("Stopping stream playback")
-            it.pause()
+    private fun initVideoEncoder(width: Int, height: Int) {
+        try {
+            // Get video encoder
+            videoEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+
+            // Configure video format (H.264)
+            val videoFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
+
+            // Set encoding parameters
+            videoFormat.setInteger(MediaFormat.KEY_BIT_RATE, calculateBitrate(width, height))
+            videoFormat.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+            videoFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+            videoFormat.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2) // Keyframe every 2 seconds
+
+            // Configure encoder
+            videoEncoder?.configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            videoEncoder?.start()
+
+            Timber.d("Video encoder initialized: ${width}x${height}")
+
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to initialize video encoder")
+            onErrorCallback?.invoke("Failed to initialize video encoder: ${e.message}")
         }
     }
 
     /**
-     * Start polling for detection results from the server
+     * Calculate appropriate bitrate based on resolution
      */
-    fun startDetectionPolling(coroutineScope: CoroutineScope) {
-        if (isPolling.compareAndSet(false, true)) {
-            Timber.d("Starting detection polling")
+    private fun calculateBitrate(width: Int, height: Int): Int {
+        // Base bitrate on resolution (0.1 bits per pixel at 30fps is a good starting point)
+        return (width * height * 30 * 0.1).toInt()
+    }
 
-            detectionJob = coroutineScope.launch {
-                while (isActive && isPolling.get()) {
-                    try {
-                        // Fetch detection results
-                        val objects = apiService.getDetectedObjects()
+    /**
+     * Start RTSP stream
+     */
+    fun startStream() {
+        if (isStreaming.get()) return
 
-                        // Convert to app model
-                        val detectedObjects = objects.map { DetectedObject.fromJson(it) }
+        try {
+            // Create RTSP URL
+            val rtspUrl = "rtsp://$serverIp:$rtspPort/$streamPath"
 
-                        // Update LiveData
-                        _detectionResults.postValue(DetectionResult(detectedObjects))
+            // Start RTSP streaming
+            rtspClient.connect(rtspUrl)
 
-                        // Fetch stats
-                        val stats = apiService.getStats()
-                        stats["fps"]?.let { fpsStr ->
-                            try {
-                                val fpsValue = fpsStr.toFloat()
-                                _fps.postValue(fpsValue)
-                            } catch (e: NumberFormatException) {
-                                Timber.e("Failed to parse FPS: $fpsStr")
-                            }
-                        }
+            isStreaming.set(true)
+            Timber.d("RTSP stream started to $rtspUrl")
 
-                        // No errors, clear any previous error
-                        _error.postValue(null)
-                        _isConnected.postValue(true)
-                    } catch (e: Exception) {
-                        when (e) {
-                            is IOException -> {
-                                Timber.e(e, "Network error while polling")
-                                _error.postValue("Network error: ${e.message}")
-                                _isConnected.postValue(false)
-                            }
-                            else -> {
-                                Timber.e(e, "Error while polling for detections")
-                                _error.postValue("Error: ${e.message}")
-                            }
-                        }
-                    }
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to start RTSP stream")
+            onErrorCallback?.invoke("Failed to start streaming: ${e.message}")
+        }
+    }
 
-                    // Poll every 500ms
-                    delay(500)
+    /**
+     * Stop RTSP stream
+     */
+    fun stopStream() {
+        if (!isStreaming.get()) return
+
+        try {
+            // Stop RTSP streaming
+            rtspClient.disconnect()
+
+            // Release video encoder
+            videoEncoder?.stop()
+            videoEncoder?.release()
+            videoEncoder = null
+
+            isStreaming.set(false)
+            Timber.d("RTSP stream stopped")
+
+        } catch (e: Exception) {
+            Timber.e(e, "Error stopping RTSP stream")
+        }
+    }
+
+    /**
+     * Disconnect from server
+     */
+    fun disconnect() {
+        // Stop streaming if active
+        if (isStreaming.get()) {
+            stopStream()
+        }
+
+        // Close data channel
+        try {
+            dataOutputStream?.close()
+            dataSocket?.close()
+            dataOutputStream = null
+            dataSocket = null
+        } catch (e: Exception) {
+            Timber.e(e, "Error closing data connection")
+        }
+
+        isConnected = false
+        onDisconnectedCallback?.invoke()
+
+        Timber.d("Disconnected from server")
+    }
+
+    /**
+     * Send camera frame and AR tracking data to server
+     */
+    fun sendFrame(image: Image, trackingData: ArTrackingData) {
+        if (!isStreaming.get() || !isConnected) return
+
+        try {
+            // Initialize encoder if needed
+            if (videoEncoder == null) {
+                initVideoEncoder(image.width, image.height)
+            }
+
+            // Encode and send video frame via RTSP
+            encodeAndSendFrame(image)
+
+            // Send AR tracking data via separate data channel
+            sendTrackingData(trackingData)
+
+        } catch (e: Exception) {
+            Timber.e(e, "Error sending frame")
+        }
+    }
+
+    /**
+     * Encode and send video frame via RTSP
+     */
+    private fun encodeAndSendFrame(image: Image) {
+        // This is a simplified version - actual implementation would
+        // handle YUV to encoder input buffer conversion
+
+        try {
+            // Get a buffer from the encoder
+            val inputBufferIndex = videoEncoder?.dequeueInputBuffer(0) ?: -1
+            if (inputBufferIndex >= 0) {
+                val inputBuffer = videoEncoder?.getInputBuffer(inputBufferIndex)
+                inputBuffer?.clear()
+
+                // Fill the buffer with the image data
+                // (actual implementation would convert YUV420 from camera to the encoder format)
+                fillInputBuffer(inputBuffer, image)
+
+                // Queue the buffer
+                videoEncoder?.queueInputBuffer(
+                    inputBufferIndex,
+                    0,
+                    inputBuffer?.capacity() ?: 0,
+                    System.nanoTime() / 1000,
+                    0
+                )
+            }
+
+            // Get the encoded data from the encoder
+            var outputBufferIndex = videoEncoder?.dequeueOutputBuffer(videoBufferInfo, 0) ?: -1
+            while (outputBufferIndex >= 0) {
+                val outputBuffer = videoEncoder?.getOutputBuffer(outputBufferIndex)
+
+                // Send encoded frame to RTSP client
+                if (outputBuffer != null) {
+                    rtspClient.sendVideo(outputBuffer, videoBufferInfo)
+                }
+
+                // Release the buffer
+                videoEncoder?.releaseOutputBuffer(outputBufferIndex, false)
+                outputBufferIndex = videoEncoder?.dequeueOutputBuffer(videoBufferInfo, 0) ?: -1
+            }
+
+        } catch (e: Exception) {
+            Timber.e(e, "Error encoding video frame")
+        }
+    }
+
+    /**
+     * Fill encoder input buffer with image data
+     * This is a placeholder - actual implementation would depend on the specific image format
+     */
+    private fun fillInputBuffer(buffer: ByteBuffer?, image: Image) {
+        // This is a simplified example - actual implementation would convert
+        // YUV420 from camera to the encoder format correctly
+
+        // Get the YUV planes
+        val planes = image.planes
+
+        // Get the buffer sizes
+        val yBuffer = planes[0].buffer
+        val uBuffer = planes[1].buffer
+        val vBuffer = planes[2].buffer
+
+        // Copy Y plane
+        val ySize = yBuffer.remaining()
+        buffer?.put(yBuffer)
+
+        // Copy U and V planes
+        // Note: This is a simplified approach and might not be correct for all YUV formats
+        val uSize = uBuffer.remaining()
+        buffer?.put(uBuffer)
+
+        val vSize = vBuffer.remaining()
+        buffer?.put(vBuffer)
+
+        // Rewind the buffer
+        buffer?.rewind()
+    }
+
+    /**
+     * Send AR tracking data via data channel
+     */
+    private fun sendTrackingData(trackingData: ArTrackingData) {
+        try {
+            // Check if data channel is connected
+            if (dataOutputStream == null) {
+                Timber.w("Data channel not connected")
+                return
+            }
+
+            // Convert tracking data to JSON
+            val json = gson.toJson(trackingData)
+
+            // Add message type and length prefix
+            val message = "ARDATA ${json.length}\n$json"
+
+            // Send data
+            dataOutputStream?.write(message.toByteArray())
+            dataOutputStream?.flush()
+
+        } catch (e: Exception) {
+            Timber.e(e, "Error sending AR tracking data")
+
+            // Try to reconnect data channel if needed
+            if (e is IOException) {
+                try {
+                    connectDataChannel()
+                } catch (reconnectEx: Exception) {
+                    Timber.e(reconnectEx, "Failed to reconnect data channel")
                 }
             }
         }
     }
 
     /**
-     * Stop polling for detection results
+     * Send tap event to server
      */
-    fun stopDetectionPolling() {
-        if (isPolling.compareAndSet(true, false)) {
-            Timber.d("Stopping detection polling")
-            detectionJob?.cancel()
-            detectionJob = null
+    fun sendTapEvent(tapEvent: TapEvent) {
+        try {
+            // Check if data channel is connected
+            if (dataOutputStream == null) {
+                Timber.w("Data channel not connected")
+                return
+            }
+
+            // Convert tap event to JSON
+            val json = gson.toJson(tapEvent)
+
+            // Add message type and length prefix
+            val message = "ARTAP ${json.length}\n$json"
+
+            // Send data
+            dataOutputStream?.write(message.toByteArray())
+            dataOutputStream?.flush()
+
+            Timber.d("Tap event sent")
+
+        } catch (e: Exception) {
+            Timber.e(e, "Error sending tap event")
         }
     }
 
     /**
-     * Clean up resources
+     * Check if connected to server
      */
-    fun cleanup() {
-        Timber.d("Cleaning up RTSP client")
-        stopDetectionPolling()
-        releasePlayer()
-    }
+    fun isConnected(): Boolean = isConnected
 
     /**
-     * Retrofit interface for the detection server API
+     * Check if streaming
      */
-    interface DetectionApiService {
-        @GET("/detected_objects")
-        suspend fun getDetectedObjects(): List<Map<String, Any>>
-
-        @GET("/stats")
-        suspend fun getStats(): Map<String, String>
-    }
+    fun isStreaming(): Boolean = isStreaming.get()
 }

@@ -1,13 +1,9 @@
 package com.yourusername.arcoredetection.models
 
 import android.graphics.RectF
-import java.util.UUID
 
-/**
- * Represents an object detected by the model
- */
 data class DetectedObject(
-    val id: String = UUID.randomUUID().toString(),
+    val id: String,
     val className: String,
     val confidence: Float,
     val boundingBox: RectF,
@@ -27,6 +23,7 @@ data class DetectedObject(
             )
 
             return DetectedObject(
+                id = java.util.UUID.randomUUID().toString(),
                 className = name,
                 confidence = confidence,
                 boundingBox = boundingBox
@@ -35,9 +32,6 @@ data class DetectedObject(
     }
 }
 
-/**
- * A list of detected objects with timestamp
- */
 data class DetectionResult(
     val objects: List<DetectedObject>,
     val timestamp: Long = System.currentTimeMillis()

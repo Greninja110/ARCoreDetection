@@ -1,6 +1,6 @@
 package com.yourusername.arcoredetection.models
 
-// Update imports to match SceneView 2.2.1 structure
+// Use appropriate math imports
 import dev.romainguy.kotlin.math.Float3
 import dev.romainguy.kotlin.math.Quaternion
 

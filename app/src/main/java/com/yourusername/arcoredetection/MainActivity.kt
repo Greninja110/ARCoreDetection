@@ -11,16 +11,12 @@ import android.widget.ArrayAdapter
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.Preview
+import androidx.camera.view.PreviewView
 import androidx.lifecycle.lifecycleScope
-import com.google.android.exoplayer2.ui.PlayerView
-import io.github.sceneview.ar.ArSceneView
 import com.yourusername.arcoredetection.databinding.ActivityMainBinding
-import com.yourusername.arcoredetection.models.ARModels
-import com.yourusername.arcoredetection.models.DetectionResult
+import com.yourusername.arcoredetection.network.RtspClient
 import com.yourusername.arcoredetection.utils.PermissionHelper
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import timber.log.Timber
 
@@ -48,9 +44,11 @@ class MainActivity : AppCompatActivity() {
     private var streamingService: StreamingService? = null
     private var serviceBound = false
 
-    // Server URL - Should be configurable
-    private var serverUrl = "http://192.168.1.100:5000"
-    private var rtspUrl = "rtsp://192.168.1.100:8554/live"
+    // Server configuration
+    private var serverIp = "192.168.1.100" // Your laptop IP address - should be configurable
+    private var rtspPort = 8554
+    private var dataPort = 8555
+    private var streamPath = "live"
 
     // AR Mode active
     private var arModeActive = false
@@ -63,27 +61,18 @@ class MainActivity : AppCompatActivity() {
             streamingService = binder.getService()
             serviceBound = true
 
-            // Set up observers for service state
-            lifecycleScope.launch {
-                streamingService?.isStreaming?.collect { isStreaming ->
-                    binding.tvStreaming.text = if (isStreaming) "Streaming: Yes" else "Streaming: No"
-                }
-            }
-
-            lifecycleScope.launch {
-                streamingService?.networkInfo?.collect { info ->
-                    info?.let {
-                        // Update UI with network info if needed
-                        Timber.d("Network info: ping=${it.ping}ms, upload=${it.uploadSpeed}Mbps")
-                    }
-                }
-            }
+            // Update UI with service state
+            updateServiceStatus()
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             Timber.d("Disconnected from StreamingService")
             streamingService = null
             serviceBound = false
+
+            // Update UI
+            binding.tvStatus.text = "Status: Disconnected"
+            binding.tvStreaming.text = "Streaming: No"
         }
     }
 
@@ -95,9 +84,6 @@ class MainActivity : AppCompatActivity() {
         // Initialize binding
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-
-        // Initialize camera manager
-        cameraManager = CameraManager(this)
 
         // Initialize permission helper
         permissionHelper = PermissionHelper(this)
@@ -133,6 +119,33 @@ class MainActivity : AppCompatActivity() {
         Timber.d("Initializing app components")
 
         // Initialize camera manager
+        cameraManager = CameraManager(this)
+
+        // Initialize camera
+        initializeCamera()
+
+        // Create RTSP client
+        rtspClient = RtspClient(
+            serverIp = serverIp,
+            rtspPort = rtspPort,
+            dataPort = dataPort,
+            streamPath = streamPath
+        )
+
+        // Initialize AR Renderer with RTSP client
+        arRenderer = ARRenderer(this, binding.arSceneView, rtspClient)
+
+        // Set up UI elements
+        setupUI()
+
+        // Show connection dialog
+        showConnectionDialog()
+    }
+
+    /**
+     * Initialize the camera system
+     */
+    private fun initializeCamera() {
         cameraManager.initialize(
             this,
             onInitialized = {
@@ -144,18 +157,6 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Camera initialization failed: ${e.message}", Toast.LENGTH_LONG).show()
             }
         )
-
-        // Initialize RTSP client
-        rtspClient = RtspClient(this)
-
-        // Initialize AR Renderer with the ArSceneView from the layout
-        arRenderer = ARRenderer(this, binding.arSceneView)
-
-        // Set up UI elements
-        setupUI()
-
-        // Show connection dialog to configure the server
-        showConnectionDialog()
     }
 
     /**
@@ -172,7 +173,7 @@ class MainActivity : AppCompatActivity() {
         )
 
         // Connect preview surface
-        val previewView = findViewById<androidx.camera.view.PreviewView>(R.id.playerView)
+        val previewView = findViewById<PreviewView>(R.id.playerView)
         cameraManager.connectPreview(previewView.surfaceProvider)
 
         Timber.d("Camera preview started")
@@ -192,91 +193,119 @@ class MainActivity : AppCompatActivity() {
             toggleARMode()
         }
 
-        // Set up AR model spinner
-        val modelList = ARModels.availableModels
-        val modelNames = modelList.map { it.name }.toTypedArray()
-
-        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, modelNames)
-        binding.spinnerModels.adapter = adapter
-
-        binding.spinnerModels.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                val selectedModel = ARModels.availableModels[position]
-                Timber.d("Selected model: ${selectedModel.name}")
-                arRenderer.selectModel(selectedModel.id)
-            }
-
-            override fun onNothingSelected(parent: AdapterView<*>?) {
-                arRenderer.clearSelectedModel()
-            }
-        }
-
-        // Set up place button
-        binding.btnPlace.setOnClickListener {
-            // No need to do anything here, the tap listener in ARRenderer will handle it
-            Toast.makeText(this, "Tap on a surface to place the model", Toast.LENGTH_SHORT).show()
-        }
-
-        // Set up clear button
-        binding.btnClear.setOnClickListener {
-            arRenderer.clearModels()
-            Toast.makeText(this, "Cleared all models", Toast.LENGTH_SHORT).show()
-        }
-
         // Hide AR controls initially
-        showARControls(false)
+        binding.arControlsGroup.visibility = View.GONE
 
         // Enable AR toggle button once camera is initialized
         binding.btnToggleAr.isEnabled = true
+
+        // Setup status display
+        binding.tvStatus.text = "Status: Disconnected"
+        binding.tvStreaming.text = "Streaming: No"
+        binding.tvFps.text = "FPS: 0"
+        binding.tvObjectCount.text = "Objects: 0"
+    }
+
+    /**
+     * Update UI with service status
+     */
+    private fun updateServiceStatus() {
+        lifecycleScope.launch(Dispatchers.Main) {
+            val isStreaming = streamingService?.isStreaming?.value ?: false
+            val status = if (serviceBound) "Connected" else "Disconnected"
+
+            binding.tvStatus.text = "Status: $status"
+            binding.tvStreaming.text = "Streaming: ${if (isStreaming) "Yes" else "No"}"
+        }
     }
 
     /**
      * Show dialog to configure server connection
      */
     private fun showConnectionDialog() {
-        // Create a dialog with text fields for server URL and RTSP URL
+        // Create a dialog with text fields for server configuration
         val builder = AlertDialog.Builder(this)
-        builder.setTitle("Connect to Server")
+        builder.setTitle("Connect to Laptop Server")
 
         val dialogView = layoutInflater.inflate(R.layout.dialog_server_config, null)
-        val serverUrlField = dialogView.findViewById<android.widget.EditText>(R.id.editServerUrl)
+        val serverIpField = dialogView.findViewById<android.widget.EditText>(R.id.editServerUrl)
         val rtspUrlField = dialogView.findViewById<android.widget.EditText>(R.id.editRtspUrl)
 
         // Set current values
-        serverUrlField.setText(serverUrl)
-        rtspUrlField.setText(rtspUrl)
+        serverIpField.setText(serverIp)
+        rtspUrlField.setText("rtsp://$serverIp:$rtspPort/$streamPath")
 
         builder.setView(dialogView)
 
         builder.setPositiveButton("Connect") { _, _ ->
-            // Update URLs
-            serverUrl = serverUrlField.text.toString()
-            rtspUrl = rtspUrlField.text.toString()
+            // Update server IP and RTSP URL
+            serverIp = serverIpField.text.toString()
+            val rtspUrlText = rtspUrlField.text.toString()
 
-            Timber.d("Connecting to server: $serverUrl, RTSP: $rtspUrl")
+            // Extract RTSP parts if needed
+            val rtspRegex = "rtsp://(.*?):(\\d+)/(.*)".toRegex()
+            val match = rtspRegex.find(rtspUrlText)
 
-            // Start streaming service if bound
-            val serverIp = extractServerIp(rtspUrl)
-            val serverPort = extractServerPort(rtspUrl)
-
-            streamingService?.startStreaming("720p", serverIp, serverPort) ?: run {
-                // Start the service if not bound
-                Intent(this, StreamingService::class.java).also { intent ->
-                    intent.action = StreamingService.ACTION_START_STREAMING
-                    intent.putExtra(StreamingService.EXTRA_QUALITY, "720p")
-                    intent.putExtra(StreamingService.EXTRA_SERVER_IP, serverIp)
-                    intent.putExtra(StreamingService.EXTRA_SERVER_PORT, serverPort)
-                    startService(intent)
-                }
+            if (match != null) {
+                serverIp = match.groupValues[1]
+                rtspPort = match.groupValues[2].toIntOrNull() ?: 8554
+                streamPath = match.groupValues[3]
             }
 
-            // Configure client
-            rtspClient.configure(serverUrl, rtspUrl)
+            Timber.d("Connecting to server: $serverIp:$rtspPort/$streamPath")
 
-            // Update UI
-            binding.btnConnect.text = "Connected"
-            binding.tvStatus.text = "Status: Connected"
-            binding.btnToggleAr.isEnabled = true
+            // Create new RTSP client with updated configuration
+            rtspClient = RtspClient(
+                serverIp = serverIp,
+                rtspPort = rtspPort,
+                dataPort = dataPort,
+                streamPath = streamPath
+            )
+
+            // Initialize AR Renderer with new RTSP client
+            arRenderer = ARRenderer(this, binding.arSceneView, rtspClient)
+
+            // Connect to server
+            lifecycleScope.launch {
+                try {
+                    rtspClient.connect(
+                        onConnected = {
+                            runOnUiThread {
+                                binding.tvStatus.text = "Status: Connected"
+                                binding.btnConnect.text = "Connected"
+                                binding.btnToggleAr.isEnabled = true
+
+                                // Show toast notification
+                                Toast.makeText(this@MainActivity, "Connected to server", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        onDisconnected = {
+                            runOnUiThread {
+                                binding.tvStatus.text = "Status: Disconnected"
+                                binding.btnConnect.text = "Connect to Server"
+
+                                // Show toast notification
+                                Toast.makeText(this@MainActivity, "Disconnected from server", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        onError = { error ->
+                            runOnUiThread {
+                                binding.tvStatus.text = "Status: Error"
+                                binding.btnConnect.text = "Connect to Server"
+
+                                // Show error message
+                                Toast.makeText(this@MainActivity, "Connection error: $error", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    )
+                } catch (e: Exception) {
+                    Timber.e(e, "Failed to connect to server")
+
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, "Failed to connect: ${e.message}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
         }
 
         builder.setNegativeButton("Cancel") { dialog, _ ->
@@ -285,26 +314,6 @@ class MainActivity : AppCompatActivity() {
 
         connectionDialog = builder.create()
         connectionDialog?.show()
-    }
-
-    /**
-     * Extract server IP from RTSP URL
-     */
-    private fun extractServerIp(rtspUrl: String): String {
-        // Simple extraction, assumes format rtsp://ip:port/path
-        val regex = "rtsp://(.*?)(?::\\d+)?/".toRegex()
-        val matchResult = regex.find(rtspUrl)
-        return matchResult?.groupValues?.get(1) ?: "192.168.1.100"
-    }
-
-    /**
-     * Extract server port from RTSP URL
-     */
-    private fun extractServerPort(rtspUrl: String): Int {
-        // Simple extraction, assumes format rtsp://ip:port/path
-        val regex = "rtsp://.*?:(\\d+)/".toRegex()
-        val matchResult = regex.find(rtspUrl)
-        return matchResult?.groupValues?.get(1)?.toIntOrNull() ?: 8554
     }
 
     /**
@@ -321,12 +330,6 @@ class MainActivity : AppCompatActivity() {
             // Show AR scene view
             binding.arSceneView.visibility = View.VISIBLE
 
-            // Fade out player view slightly to show AR overlay
-            findViewById<PlayerView>(R.id.playerView).alpha = 0.7f
-
-            // Show AR controls
-            showARControls(true)
-
             // Initialize AR renderer
             lifecycleScope.launch(Dispatchers.Main) {
                 arRenderer.initialize(lifecycleScope)
@@ -335,6 +338,9 @@ class MainActivity : AppCompatActivity() {
                 arRenderer.setOnARErrorListener { error ->
                     Toast.makeText(this@MainActivity, error, Toast.LENGTH_SHORT).show()
                 }
+
+                // Start streaming AR data
+                arRenderer.startStreaming()
             }
         } else {
             // Switch to normal mode
@@ -344,11 +350,8 @@ class MainActivity : AppCompatActivity() {
             // Hide AR scene view
             binding.arSceneView.visibility = View.GONE
 
-            // Restore player view opacity
-            findViewById<PlayerView>(R.id.playerView).alpha = 1.0f
-
-            // Hide AR controls
-            showARControls(false)
+            // Stop AR streaming
+            arRenderer.stopStreaming()
 
             // Clean up AR renderer
             arRenderer.cleanup()
@@ -356,71 +359,28 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Show or hide AR controls
+     * Update FPS display
      */
-    private fun showARControls(show: Boolean) {
-        binding.arControlsGroup.visibility = if (show) View.VISIBLE else View.GONE
-    }
-
-    /**
-     * Set up observers for LiveData from RTSP client
-     */
-    private fun setupObservers() {
-        // Observe connection state
-        rtspClient.isConnected.observe(this) { connected ->
-            binding.tvStatus.text = if (connected) "Status: Connected" else "Status: Disconnected"
-        }
-
-        // Observe streaming state
-        rtspClient.isStreaming.observe(this) { streaming ->
-            binding.tvStreaming.text = if (streaming) "Streaming: Yes" else "Streaming: No"
-        }
-
-        // Observe detection results
-        rtspClient.detectionResults.observe(this) { result ->
-            updateDetectionResults(result)
-        }
-
-        // Observe FPS
-        rtspClient.fps.observe(this) { fps ->
-            binding.tvFps.text = "FPS: $fps"
-        }
-
-        // Observe errors
-        rtspClient.error.observe(this) { error ->
-            error?.let {
-                Toast.makeText(this, it, Toast.LENGTH_SHORT).show()
-                Timber.e("RTSP error: $it")
-            }
-        }
-    }
-
-    /**
-     * Update UI with detection results
-     */
-    private fun updateDetectionResults(result: DetectionResult) {
-        Timber.d("Received ${result.objects.size} detection results")
-
-        // Update detection count
-        binding.tvObjectCount.text = "Objects: ${result.objects.size}"
-
-        // If AR mode is active, overlay detections
-        if (arModeActive && arRenderer.isActive()) {
-            arRenderer.overlayDetections(result.objects)
-        }
+    fun updateFps(fps: Float) {
+        binding.tvFps.text = "FPS: ${String.format("%.1f", fps)}"
     }
 
     override fun onResume() {
         super.onResume()
         Timber.d("onResume()")
 
-        // Set up observers
-        setupObservers()
+        // Update service status
+        updateServiceStatus()
     }
 
     override fun onPause() {
         super.onPause()
         Timber.d("onPause()")
+
+        // Stop streaming if active
+        if (arModeActive) {
+            arRenderer.stopStreaming()
+        }
     }
 
     override fun onDestroy() {
@@ -434,7 +394,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         // Clean up resources
-        rtspClient.cleanup()
+        rtspClient.disconnect()
         arRenderer.cleanup()
         cameraManager.shutdown()
 
