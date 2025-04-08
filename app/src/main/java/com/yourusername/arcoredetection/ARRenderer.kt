@@ -131,7 +131,7 @@ class ARRenderer(
      */
     private fun getSession(): Session? {
         return try {
-            arSceneView.session
+            arSceneView.arSession  // Changed from arSceneView.session
         } catch (e: Exception) {
             Timber.e(e, "Error getting session: ${e.message}")
             null
@@ -143,7 +143,7 @@ class ARRenderer(
      */
     private fun getCurrentFrame(): Frame? {
         return try {
-            arSceneView.arFrame?.frame
+            arSceneView.currentFrame?.frame  // Changed from arSceneView.arFrame?.frame
         } catch (e: Exception) {
             Timber.e(e, "Error getting frame: ${e.message}")
             null

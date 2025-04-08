@@ -39,7 +39,8 @@
         <!-- Meta-data for ARCore -->
         <meta-data
             android:name="com.google.ar.core"
-            android:value="required" />
+            android:value="required"
+            tools:node="replace" />
 
         <activity
             android:name=".MainActivity"
