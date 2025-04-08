@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ARCore Detection</string>
+    <string name="connect_to_server">Connect to Server</string>
+    <string name="enable_ar">Enable AR</string>
+    <string name="disable_ar">Disable AR</string>
+    <string name="place">Place</string>
+    <string name="clear_all">Clear All</string>
+    <string name="select_3d_model">Select 3D Model:</string>
+    <string name="status_disconnected">Status: Disconnected</string>
+    <string name="status_connected">Status: Connected</string>
+    <string name="streaming_no">Streaming: No</string>
+    <string name="streaming_yes">Streaming: Yes</string>
+    <string name="fps_format">FPS: %.1f</string>
+    <string name="objects_count">Objects: %d</string>
+    <string name="tap_to_place">Tap on a surface to place the model</string>
+    <string name="models_cleared">Cleared all models</string>
+    <string name="ar_not_supported">ARCore is not supported on this device</string>
+    <string name="permissions_required">This app requires camera and internet permissions</string>
+    <string name="server_url">Server URL:</string>
+    <string name="rtsp_url">RTSP URL:</string>
+    <string name="server_url_hint">http://192.168.1.100:5000</string>
+    <string name="rtsp_url_hint">rtsp://192.168.1.100:8554/live</string>
+    <string name="server_note">Note: Make sure your detection server is running and accessible from this device</string>
+</resources>
