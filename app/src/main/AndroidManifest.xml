@@ -5,9 +5,16 @@
     <!-- Internet permission for RTSP streaming -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
 
     <!-- Camera permission for AR -->
     <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- Storage permissions for saving recordings -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
 
     <!-- AR Required and Optional features -->
     <uses-feature android:name="android.hardware.camera" android:required="true" />
@@ -44,6 +51,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-    </application>
 
+        <!-- Streaming Service -->
+        <service
+            android:name=".StreamingService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="camera" />
+    </application>
 </manifest>

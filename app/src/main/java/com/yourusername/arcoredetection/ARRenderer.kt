@@ -1,25 +1,23 @@
 package com.yourusername.arcoredetection
 
 import android.content.Context
-import android.view.MotionEvent
 import com.google.ar.core.Anchor
 import com.google.ar.core.HitResult
-import com.google.ar.core.Plane
-import io.github.sceneview.ar.ArSceneView
-import io.github.sceneview.ar.node.ArModelNode
-import io.github.sceneview.ar.node.PlacementMode
-import io.github.sceneview.math.Position
-import io.github.sceneview.math.Rotation
-import io.github.sceneview.math.Scale
 import com.yourusername.arcoredetection.models.ARModel
 import com.yourusername.arcoredetection.models.ARModels
 import com.yourusername.arcoredetection.models.DetectedObject
 import com.yourusername.arcoredetection.models.PlacedModel
+import dev.romainguy.kotlin.math.Float3
+import dev.romainguy.kotlin.math.Quaternion
+import io.github.sceneview.ar.ArSceneView
+import io.github.sceneview.ar.node.ArNode
+import io.github.sceneview.node.ModelNode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import timber.log.Timber
+import java.util.concurrent.CompletableFuture
 
 /**
  * Handles AR rendering and object placement using ARCore and SceneView
@@ -37,8 +35,8 @@ class ARRenderer(
     // Currently selected model
     private var selectedModel: ARModel? = null
 
-    // Model nodes
-    private val modelNodes = mutableMapOf<String, ArModelNode>()
+    // Store model nodes by id
+    private val modelNodes = mutableMapOf<String, CompletableFuture<ModelNode>>()
 
     // Callbacks
     private var onModelPlacedListener: ((PlacedModel) -> Unit)? = null
@@ -52,23 +50,15 @@ class ARRenderer(
 
         try {
             // Set up AR session callbacks
-            arSceneView.onArSessionCreated = {
+            arSceneView.onSessionCreated = {
                 Timber.d("AR Session created")
                 isARActive = true
             }
 
-            arSceneView.onArFrame = { arFrame ->
-                // Handle AR frame updates if needed
-            }
-
-            // Set up plane tap detection
-            arSceneView.onTapAr = { hitResult, motionEvent ->
-                if (motionEvent.action == MotionEvent.ACTION_UP) {
-                    onTapPlane(hitResult)
-                    true
-                } else {
-                    false
-                }
+            // Set up tap listener
+            arSceneView.onTapArPlane = { hitResult, _, _ ->
+                onTapPlane(hitResult)
+                true
             }
 
             // Preload all models
@@ -90,34 +80,14 @@ class ARRenderer(
             ARModels.availableModels.forEach { model ->
                 try {
                     Timber.d("Preloading model: ${model.name}")
+                    val modelFuture = ModelNode.loadModel(
+                        context = context,
+                        glbFileLocation = "models/${model.resourceName}.glb",
+                        autoAnimate = true
+                    )
 
-                    // Create a model node
-                    val modelNode = ArModelNode(
-                        placementMode = PlacementMode.INSTANT
-                    ).apply {
-                        // Load model from assets
-                        loadModelAsync(
-                            context = context,
-                            glbFileLocation = "models/${model.resourceName}.glb",
-                            autoAnimate = true,
-                            scaleToUnits = 1.0f,
-                            centerOrigin = Position(x = 0.0f, y = 0.0f, z = 0.0f)
-                        ) { modelInstance ->
-                            Timber.d("Model loaded successfully: ${model.name}")
-                        }
-
-                        // Set scale from model data
-                        modelScale = Scale(
-                            model.scale.x,
-                            model.scale.y,
-                            model.scale.z
-                        )
-                    }
-
-                    // Store the model node
-                    modelNodes[model.id] = modelNode
-                    Timber.d("Successfully preloaded model: ${model.name}")
-
+                    modelNodes[model.id] = modelFuture
+                    Timber.d("Model loading initiated: ${model.name}")
                 } catch (e: Exception) {
                     Timber.e(e, "Failed to preload model: ${model.name}")
                 }
@@ -158,64 +128,68 @@ class ARRenderer(
 
         Timber.d("Tap on plane detected, placing model: ${model.name}")
 
-        // Get the preloaded model node
-        val preloadedNode = modelNodes[model.id]
-        if (preloadedNode == null) {
-            Timber.e("Preloaded model not found for: ${model.id}")
-            onARErrorListener?.invoke("Model not loaded yet")
-            return
-        }
-
         try {
-            // Create a new model node for placement
-            val placedNode = ArModelNode(
-                placementMode = PlacementMode.BEST_AVAILABLE
-            ).apply {
-                // Load the same model as the preloaded one
-                loadModelAsync(
-                    context = context,
-                    glbFileLocation = "models/${model.resourceName}.glb",
-                    autoAnimate = true,
-                    scaleToUnits = 1.0f,
-                    centerOrigin = Position(x = 0.0f, y = 0.0f, z = 0.0f)
-                )
-
-                // Use the same scale
-                modelScale = Scale(
-                    model.scale.x,
-                    model.scale.y,
-                    model.scale.z
-                )
-
-                // Anchor at the hit position
-                anchor(hitResult.createAnchor())
+            // Get the model future from our preloaded models
+            val modelFuture = modelNodes[model.id]
+            if (modelFuture == null) {
+                Timber.e("Model not found in preloaded models: ${model.id}")
+                onARErrorListener?.invoke("Model not ready yet")
+                return
             }
 
-            // Add to scene
-            arSceneView.addChild(placedNode)
+            // Create anchor from hit result
+            val anchor = hitResult.createAnchor()
 
-            // Create a model reference object
-            val placedModel = PlacedModel(
-                model = model,
-                position = Position(
-                    placedNode.position.x,
-                    placedNode.position.y,
-                    placedNode.position.z
-                ),
-                rotation = Rotation(
-                    placedNode.rotation.x,
-                    placedNode.rotation.y,
-                    placedNode.rotation.z
+            // Create a node for the anchor
+            val anchorNode = ArNode(anchor)
+            arSceneView.addChild(anchorNode)
+
+            // When the model is loaded, add it as a child of the anchor node
+            modelFuture.thenAccept { modelNode ->
+                // Clone the model node
+                val placedNode = ModelNode()
+                placedNode.apply {
+                    loadModelAsync(
+                        context = context,
+                        glbFileLocation = "models/${model.resourceName}.glb",
+                        autoAnimate = true
+                    )
+
+                    // Apply scale
+                    setScale(
+                        x = model.scale.x,
+                        y = model.scale.y,
+                        z = model.scale.z
+                    )
+                }
+
+                // Add to anchor node
+                anchorNode.addChild(placedNode)
+
+                // Create placed model object
+                val placedModel = PlacedModel(
+                    model = model,
+                    position = Float3(
+                        placedNode.position.x,
+                        placedNode.position.y,
+                        placedNode.position.z
+                    ),
+                    rotation = Quaternion()
                 )
-            )
 
-            // Add to list of placed models
-            placedModels.add(placedModel)
+                // Add to placed models list
+                placedModels.add(placedModel)
 
-            // Notify callback
-            onModelPlacedListener?.invoke(placedModel)
+                // Notify listener
+                onModelPlacedListener?.invoke(placedModel)
 
-            Timber.d("Model placed successfully: ${model.name} at ${placedNode.position}")
+                Timber.d("Model placed successfully: ${model.name}")
+            }.exceptionally { throwable ->
+                Timber.e(throwable, "Error loading model: ${model.name}")
+                onARErrorListener?.invoke("Error loading model: ${throwable.message}")
+                null
+            }
+
         } catch (e: Exception) {
             Timber.e(e, "Error placing model: ${e.message}")
             onARErrorListener?.invoke("Error placing model: ${e.message}")
@@ -228,9 +202,6 @@ class ARRenderer(
     fun overlayDetections(detectedObjects: List<DetectedObject>) {
         // Implementation depends on your specific requirements
         Timber.d("Overlaying ${detectedObjects.size} detected objects")
-
-        // This could involve creating visual indicators for detected objects
-        // in the AR view, but implementation depends on specific requirements
     }
 
     /**
@@ -240,10 +211,11 @@ class ARRenderer(
         Timber.d("Clearing all placed models")
 
         try {
-            // Remove all model nodes from scene
-            val nodesToRemove = arSceneView.children.filterIsInstance<ArModelNode>()
+            // Get all AR nodes
+            val nodesToRemove = arSceneView.children.filterIsInstance<ArNode>()
+
+            // Remove each node
             nodesToRemove.forEach { node ->
-                node.detachAnchor()
                 arSceneView.removeChild(node)
             }
 

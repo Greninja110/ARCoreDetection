@@ -1,12 +1,17 @@
 package com.yourusername.arcoredetection
 
+import android.content.ComponentName
+import android.content.Intent
+import android.content.ServiceConnection
 import android.os.Bundle
+import android.os.IBinder
 import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.Preview
 import androidx.lifecycle.lifecycleScope
 import com.google.android.exoplayer2.ui.PlayerView
 import io.github.sceneview.ar.ArSceneView
@@ -15,6 +20,7 @@ import com.yourusername.arcoredetection.models.ARModels
 import com.yourusername.arcoredetection.models.DetectionResult
 import com.yourusername.arcoredetection.utils.PermissionHelper
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import timber.log.Timber
 
@@ -22,6 +28,9 @@ class MainActivity : AppCompatActivity() {
 
     // View binding
     private lateinit var binding: ActivityMainBinding
+
+    // Camera Manager
+    private lateinit var cameraManager: CameraManager
 
     // RTSP Client
     private lateinit var rtspClient: RtspClient
@@ -35,12 +44,48 @@ class MainActivity : AppCompatActivity() {
     // Connection dialog
     private var connectionDialog: AlertDialog? = null
 
+    // Streaming service
+    private var streamingService: StreamingService? = null
+    private var serviceBound = false
+
     // Server URL - Should be configurable
     private var serverUrl = "http://192.168.1.100:5000"
     private var rtspUrl = "rtsp://192.168.1.100:8554/live"
 
     // AR Mode active
     private var arModeActive = false
+
+    // Service connection
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            Timber.d("Connected to StreamingService")
+            val binder = service as StreamingService.LocalBinder
+            streamingService = binder.getService()
+            serviceBound = true
+
+            // Set up observers for service state
+            lifecycleScope.launch {
+                streamingService?.isStreaming?.collect { isStreaming ->
+                    binding.tvStreaming.text = if (isStreaming) "Streaming: Yes" else "Streaming: No"
+                }
+            }
+
+            lifecycleScope.launch {
+                streamingService?.networkInfo?.collect { info ->
+                    info?.let {
+                        // Update UI with network info if needed
+                        Timber.d("Network info: ping=${it.ping}ms, upload=${it.uploadSpeed}Mbps")
+                    }
+                }
+            }
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            Timber.d("Disconnected from StreamingService")
+            streamingService = null
+            serviceBound = false
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -50,6 +95,9 @@ class MainActivity : AppCompatActivity() {
         // Initialize binding
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        // Initialize camera manager
+        cameraManager = CameraManager(this)
 
         // Initialize permission helper
         permissionHelper = PermissionHelper(this)
@@ -63,12 +111,18 @@ class MainActivity : AppCompatActivity() {
                     initializeApp()
                 } else {
                     Timber.e("Permissions not granted, finishing activity")
+                    Toast.makeText(this, "Camera and storage permissions are required", Toast.LENGTH_LONG).show()
                     finish()
                 }
             }
         } else {
             Timber.d("Permissions already granted")
             initializeApp()
+        }
+
+        // Bind to streaming service
+        Intent(this, StreamingService::class.java).also { intent ->
+            bindService(intent, serviceConnection, BIND_AUTO_CREATE)
         }
     }
 
@@ -77,6 +131,19 @@ class MainActivity : AppCompatActivity() {
      */
     private fun initializeApp() {
         Timber.d("Initializing app components")
+
+        // Initialize camera manager
+        cameraManager.initialize(
+            this,
+            onInitialized = {
+                // Start camera with preview
+                startCameraPreview()
+            },
+            onError = { e ->
+                Timber.e(e, "Camera initialization error")
+                Toast.makeText(this, "Camera initialization failed: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        )
 
         // Initialize RTSP client
         rtspClient = RtspClient(this)
@@ -89,6 +156,26 @@ class MainActivity : AppCompatActivity() {
 
         // Show connection dialog to configure the server
         showConnectionDialog()
+    }
+
+    /**
+     * Start camera preview
+     */
+    private fun startCameraPreview() {
+        cameraManager.startCamera(
+            this,
+            enableVideoCapture = true,
+            onError = { e ->
+                Timber.e(e, "Failed to start camera")
+                Toast.makeText(this, "Camera error: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        )
+
+        // Connect preview surface
+        val previewView = findViewById<androidx.camera.view.PreviewView>(R.id.playerView)
+        cameraManager.connectPreview(previewView.surfaceProvider)
+
+        Timber.d("Camera preview started")
     }
 
     /**
@@ -139,8 +226,8 @@ class MainActivity : AppCompatActivity() {
         // Hide AR controls initially
         showARControls(false)
 
-        // Set up video surface
-        findViewById<PlayerView>(R.id.playerView).useController = false
+        // Enable AR toggle button once camera is initialized
+        binding.btnToggleAr.isEnabled = true
     }
 
     /**
@@ -168,25 +255,27 @@ class MainActivity : AppCompatActivity() {
 
             Timber.d("Connecting to server: $serverUrl, RTSP: $rtspUrl")
 
+            // Start streaming service if bound
+            val serverIp = extractServerIp(rtspUrl)
+            val serverPort = extractServerPort(rtspUrl)
+
+            streamingService?.startStreaming("720p", serverIp, serverPort) ?: run {
+                // Start the service if not bound
+                Intent(this, StreamingService::class.java).also { intent ->
+                    intent.action = StreamingService.ACTION_START_STREAMING
+                    intent.putExtra(StreamingService.EXTRA_QUALITY, "720p")
+                    intent.putExtra(StreamingService.EXTRA_SERVER_IP, serverIp)
+                    intent.putExtra(StreamingService.EXTRA_SERVER_PORT, serverPort)
+                    startService(intent)
+                }
+            }
+
             // Configure client
             rtspClient.configure(serverUrl, rtspUrl)
 
-            // Initialize player
-            val player = rtspClient.initializePlayer { width, height ->
-                Timber.d("Video size: $width x $height")
-            }
-
-            // Set player to view
-            findViewById<PlayerView>(R.id.playerView).player = player
-
-            // Start streaming
-            rtspClient.startStreaming()
-
-            // Start detection polling
-            rtspClient.startDetectionPolling(lifecycleScope)
-
             // Update UI
             binding.btnConnect.text = "Connected"
+            binding.tvStatus.text = "Status: Connected"
             binding.btnToggleAr.isEnabled = true
         }
 
@@ -196,6 +285,26 @@ class MainActivity : AppCompatActivity() {
 
         connectionDialog = builder.create()
         connectionDialog?.show()
+    }
+
+    /**
+     * Extract server IP from RTSP URL
+     */
+    private fun extractServerIp(rtspUrl: String): String {
+        // Simple extraction, assumes format rtsp://ip:port/path
+        val regex = "rtsp://(.*?)(?::\\d+)?/".toRegex()
+        val matchResult = regex.find(rtspUrl)
+        return matchResult?.groupValues?.get(1) ?: "192.168.1.100"
+    }
+
+    /**
+     * Extract server port from RTSP URL
+     */
+    private fun extractServerPort(rtspUrl: String): Int {
+        // Simple extraction, assumes format rtsp://ip:port/path
+        val regex = "rtsp://.*?:(\\d+)/".toRegex()
+        val matchResult = regex.find(rtspUrl)
+        return matchResult?.groupValues?.get(1)?.toIntOrNull() ?: 8554
     }
 
     /**
@@ -259,12 +368,12 @@ class MainActivity : AppCompatActivity() {
     private fun setupObservers() {
         // Observe connection state
         rtspClient.isConnected.observe(this) { connected ->
-            binding.tvStatus.text = if (connected) "Connected" else "Disconnected"
+            binding.tvStatus.text = if (connected) "Status: Connected" else "Status: Disconnected"
         }
 
         // Observe streaming state
         rtspClient.isStreaming.observe(this) { streaming ->
-            binding.tvStreaming.text = if (streaming) "Streaming" else "Not streaming"
+            binding.tvStreaming.text = if (streaming) "Streaming: Yes" else "Streaming: No"
         }
 
         // Observe detection results
@@ -299,8 +408,6 @@ class MainActivity : AppCompatActivity() {
         if (arModeActive && arRenderer.isActive()) {
             arRenderer.overlayDetections(result.objects)
         }
-
-        // TODO: Update detection list in UI if needed
     }
 
     override fun onResume() {
@@ -309,30 +416,27 @@ class MainActivity : AppCompatActivity() {
 
         // Set up observers
         setupObservers()
-
-        // Resume streaming if it was active
-        if (rtspClient.isConnected.value == true) {
-            rtspClient.startStreaming()
-            rtspClient.startDetectionPolling(lifecycleScope)
-        }
     }
 
     override fun onPause() {
         super.onPause()
         Timber.d("onPause()")
-
-        // Pause streaming to save resources
-        rtspClient.stopStreaming()
-        rtspClient.stopDetectionPolling()
     }
 
     override fun onDestroy() {
         super.onDestroy()
         Timber.d("onDestroy()")
 
+        // Unbind from service
+        if (serviceBound) {
+            unbindService(serviceConnection)
+            serviceBound = false
+        }
+
         // Clean up resources
         rtspClient.cleanup()
         arRenderer.cleanup()
+        cameraManager.shutdown()
 
         // Dismiss any open dialogs
         connectionDialog?.dismiss()
