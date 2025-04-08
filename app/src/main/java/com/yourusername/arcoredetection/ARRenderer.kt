@@ -1,9 +1,12 @@
 package com.yourusername.arcoredetection
 
 import android.content.Context
+import android.view.MotionEvent
+import com.google.ar.core.Config
 import com.google.ar.core.Frame
 import com.google.ar.core.HitResult
 import com.google.ar.core.Plane
+import com.google.ar.core.Session
 import com.yourusername.arcoredetection.network.RtspClient
 import io.github.sceneview.ar.ArSceneView
 import kotlinx.coroutines.CoroutineScope
@@ -32,52 +35,146 @@ class ARRenderer(
     // Callbacks
     private var onARErrorListener: ((String) -> Unit)? = null
 
+    // Store coroutine scope
+    private lateinit var coroutineScope: CoroutineScope
+
     /**
      * Initialize the AR environment and RTSP connection
      */
-    fun initialize(coroutineScope: CoroutineScope) {
+    fun initialize(scope: CoroutineScope) {
         Timber.d("Initializing AR environment")
+        this.coroutineScope = scope
 
         try {
-            // Set up session callback
-            arSceneView.onSessionCreated = { session ->
-                Timber.d("AR Session created")
+            // Use basic initialization without special callbacks
+            // We'll rely on manual polling instead of callbacks
 
-                // Configure session for environment tracking and depth
-                session.configure(session.config.apply {
-                    // Enable depth if supported
-                    if (session.isDepthModeSupported(com.google.ar.core.Config.DepthMode.AUTOMATIC)) {
-                        this.depthMode = com.google.ar.core.Config.DepthMode.AUTOMATIC
-                    }
-
-                    // Enable instant placement for better tracking
-                    this.instantPlacementMode = com.google.ar.core.Config.InstantPlacementMode.LOCAL_Y_UP
-                })
-
-                isARActive = true
-
-                // Connect to RTSP server on laptop
-                connectRtspServer(coroutineScope)
-            }
-
-            // Setup tap handling to send tap events to server
-            arSceneView.onTapPlane = { hitResult, plane, _ ->
-                if (isStreaming) {
-                    sendTapEvent(hitResult, plane)
-                }
-                true
-            }
-
-            // Set up frame listener to stream camera and AR data
-            arSceneView.onFrame = { arFrame ->
-                if (isStreaming) {
-                    processArFrame(arFrame)
-                }
-            }
+            // Start polling for frames and session status
+            startMonitoring()
 
         } catch (e: Exception) {
             Timber.e(e, "Failed to initialize AR environment")
             onARErrorListener?.invoke("Failed to initialize AR: ${e.message}")
+        }
+    }
+
+    /**
+     * Start monitoring frames and session
+     */
+    private fun startMonitoring() {
+        // We'll monitor the ArSceneView directly from the UI thread
+        // This is a simplified approach that should work with any SceneView version
+
+        // Set a touch listener on the ArSceneView to handle taps
+        arSceneView.setOnTouchListener { _, event ->
+            if (event.action == MotionEvent.ACTION_UP) {
+                handleTouch(event)
+            }
+            false
+        }
+
+        // Use a post-delayed handler to check frame updates periodically
+        arSceneView.post(object : Runnable {
+            override fun run() {
+                try {
+                    // Check if session is available
+                    val session = getSession()
+                    if (session != null && !isARActive) {
+                        configureSession(session)
+                    }
+
+                    // Process current frame if available
+                    val frame = getCurrentFrame()
+                    if (isStreaming && frame != null) {
+                        processArFrame(frame)
+                    }
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in frame monitoring: ${e.message}")
+                }
+
+                // Continue monitoring
+                arSceneView.postDelayed(this, 16) // ~60fps
+            }
+        })
+    }
+
+    /**
+     * Handle touch events for AR plane detection
+     */
+    private fun handleTouch(event: MotionEvent): Boolean {
+        if (!isStreaming) return false
+
+        try {
+            val frame = getCurrentFrame() ?: return false
+
+            // Perform hit test at the touch point
+            val hitResults = frame.hitTest(event.x, event.y)
+            if (hitResults.isEmpty()) return false
+
+            // Find the first hit that's on a plane
+            for (hit in hitResults) {
+                val trackable = hit.trackable
+                if (trackable is Plane) {
+                    sendTapEvent(hit, trackable)
+                    return true
+                }
+            }
+        } catch (e: Exception) {
+            Timber.e(e, "Error handling touch: ${e.message}")
+        }
+
+        return false
+    }
+
+    /**
+     * Get current session safely
+     */
+    private fun getSession(): Session? {
+        return try {
+            arSceneView.session
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting session: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Get current frame safely
+     */
+    private fun getCurrentFrame(): Frame? {
+        return try {
+            arSceneView.arFrame?.frame
+        } catch (e: Exception) {
+            Timber.e(e, "Error getting frame: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Configure the AR session
+     */
+    private fun configureSession(session: Session) {
+        Timber.d("AR Session created")
+
+        try {
+            // Configure session for environment tracking and depth
+            session.configure(session.config.apply {
+                // Enable depth if supported
+                if (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
+                    depthMode = Config.DepthMode.AUTOMATIC
+                }
+
+                // Enable instant placement for better tracking
+                instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP
+            })
+
+            isARActive = true
+
+            // Connect to RTSP server on laptop using the stored coroutine scope
+            connectRtspServer(coroutineScope)
+        } catch (e: Exception) {
+            Timber.e(e, "Error configuring session: ${e.message}")
+            onARErrorListener?.invoke("Session configuration error: ${e.message}")
         }
     }
 
@@ -135,8 +232,8 @@ class ARRenderer(
                 timestamp = currentTime,
                 cameraIntrinsics = extractCameraIntrinsics(frame),
                 trackingState = frame.camera.trackingState.name,
-                cameraPose = frame.camera.pose.toMatrix(),
-                depthAvailable = frame.acquireDepthImage() != null,
+                cameraPose = convertPoseToFloatArray(frame.camera.pose),
+                depthAvailable = frame.hasDisplayGeometryChanged(), // Alternative to acquiring depth image
                 detectedPlanes = extractPlaneData(frame)
             )
 
@@ -149,6 +246,15 @@ class ARRenderer(
         } catch (e: Exception) {
             Timber.e(e, "Error processing AR frame: ${e.message}")
         }
+    }
+
+    /**
+     * Convert pose to float array
+     */
+    private fun convertPoseToFloatArray(pose: com.google.ar.core.Pose): FloatArray {
+        val matrix = FloatArray(16)
+        pose.toMatrix(matrix, 0)
+        return matrix
     }
 
     /**
@@ -200,58 +306,7 @@ class ARRenderer(
         }
     }
 
-    /**
-     * Start streaming AR data to laptop
-     */
-    fun startStreaming() {
-        if (!isStreaming && isARActive) {
-            rtspClient.startStream()
-            isStreaming = true
-            Timber.d("Started RTSP streaming")
-        }
-    }
-
-    /**
-     * Stop streaming AR data
-     */
-    fun stopStreaming() {
-        if (isStreaming) {
-            rtspClient.stopStream()
-            isStreaming = false
-            Timber.d("Stopped RTSP streaming")
-        }
-    }
-
-    /**
-     * Check if AR is currently active
-     */
-    fun isActive(): Boolean = isARActive
-
-    /**
-     * Check if currently streaming
-     */
-    fun isStreaming(): Boolean = isStreaming
-
-    /**
-     * Set a callback for AR errors
-     */
-    fun setOnARErrorListener(listener: (String) -> Unit) {
-        this.onARErrorListener = listener
-    }
-
-    /**
-     * Clean up resources when done
-     */
-    fun cleanup() {
-        Timber.d("Cleaning up AR Renderer")
-        stopStreaming()
-        rtspClient.disconnect()
-        isARActive = false
-    }
-
-    /**
-     * Data classes for streaming
-     */
+    // Data class definitions remain the same
     data class ArTrackingData(
         val timestamp: Long,
         val cameraIntrinsics: CameraIntrinsics,
@@ -349,5 +404,54 @@ class ARRenderer(
             result = 31 * result + planeId.hashCode()
             return result
         }
+    }
+
+    /**
+     * Start streaming AR data to laptop
+     */
+    fun startStreaming() {
+        if (!isStreaming && isARActive) {
+            rtspClient.startStream()
+            isStreaming = true
+            Timber.d("Started RTSP streaming")
+        }
+    }
+
+    /**
+     * Stop streaming AR data
+     */
+    fun stopStreaming() {
+        if (isStreaming) {
+            rtspClient.stopStream()
+            isStreaming = false
+            Timber.d("Stopped RTSP streaming")
+        }
+    }
+
+    /**
+     * Check if AR is currently active
+     */
+    fun isActive(): Boolean = isARActive
+
+    /**
+     * Check if currently streaming
+     */
+    fun isStreaming(): Boolean = isStreaming
+
+    /**
+     * Set a callback for AR errors
+     */
+    fun setOnARErrorListener(listener: (String) -> Unit) {
+        this.onARErrorListener = listener
+    }
+
+    /**
+     * Clean up resources when done
+     */
+    fun cleanup() {
+        Timber.d("Cleaning up AR Renderer")
+        stopStreaming()
+        rtspClient.disconnect()
+        isARActive = false
     }
 }

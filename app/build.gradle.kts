@@ -105,4 +105,7 @@ dependencies {
     implementation("com.github.pedroSG94:rtmp-rtsp-stream-client-java:2.1.8")
     implementation("com.github.pedroSG94.vlc-example-streamplayer:library:2.5.3")
     implementation("com.google.code.gson:gson:2.10.1")
+
+    // CameraX Video
+    implementation("androidx.camera:camera-video:1.3.1")
 }
